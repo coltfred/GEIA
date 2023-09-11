@@ -179,7 +179,8 @@ def eval_on_batch(batch_X,batch_D,model,tokenizer,device,config):
             sentence = generate_sentence(config,hidden_X=inputs_embeds)
         sent_list.append(sentence)
 
-
+    print(sent_list)
+    print(gt_list)
 
     return sent_list, gt_list
 

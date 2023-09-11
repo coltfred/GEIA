@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import argparse
 import sys
+import requests
 
 from transformers import AutoModel, AutoTokenizer
 from transformers import AutoModelForCausalLM
@@ -22,6 +23,10 @@ from simcse_persona import get_persona_dict
 from attacker_evaluation_gpt import eval_on_batch
 from datasets import load_dataset
 from data_process import get_sent_list
+from codetiming import Timer
+
+s = requests.Session()
+
 
 class linear_projection(nn.Module):
     def __init__(self, in_num, out_num=1024):
@@ -54,10 +59,38 @@ class personachat(Dataset):
         
     def collate(self, unpacked_data):
         return unpacked_data
+@Timer(name="encrypt_embeddings_one_way", text="{name}: {milliseconds:.1f} ms")
+def encrypt_embeddings_one_way(embeddings: np.ndarray) -> np.ndarray:
+    # our request has to be a str so request doesn't implicitly try to get creative
+    # (it really doesn't like key-less JSON requests)
+    # timer = Timer(name="encrypt_embeddings_one_way.toList", text="{name}: {milliseconds:.1f} ms")
+    # timer.start()
+    request = str(embeddings.tolist())
+    # timer.stop()
+    # timer = Timer(name="encrypt_embeddings_one_way.post", text="{name}: {milliseconds:.1f} ms")
+    # timer.start()
+    res = s.post(
+        "http://localhost:10337/ironcore/embeddings/encrypt-one-way",
+        data=request,
+        headers={"content-type": "application/json"},
+    )
+    # timer.stop()
+    if res.status_code != 200:
+        print("request {0} size {1}".format(request, len(request.encode("utf-8"))))
+        print("response {0}".format(res.text))
+        print("status code {0}".format(res.status_code))
+    # float32 because faiss errors on float64
+    # timer = Timer(name="encrypt_embeddings_one_way.text", text="{name}: {milliseconds:.1f} ms")
+    # timer.start()
+    reformatted = np.asarray(res.json()).astype(np.float32)
+    # timer.stop()
+    return reformatted
 
 def process_data(data,batch_size,device,config,need_porj=True):
     #model = SentenceTransformer('all-roberta-large-v1',device=device)   # dim 1024
-    device_1 = torch.device("cuda:0")
+    device_1 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
     model = SentenceTransformer(config['embed_model_path'],device=device_1)   # dim 768
     dataset = personachat(data)
     dataloader = DataLoader(dataset=dataset, 
@@ -106,6 +139,15 @@ def process_data(data,batch_size,device,config,need_porj=True):
             if need_porj:
                embeddings = projection(embeddings)
 
+            timer = Timer(name="detatch time",text="{name}: {milliseconds:.1f} ms")
+            timer.start()
+            detatched_embeddings = embeddings.cpu().detach().numpy()
+            timer.stop()
+            timer = Timer(name="from_numpy_and_encrypt",text="{name}: {milliseconds:.1f} ms")
+            timer.start()
+            embeddings = torch.from_numpy(encrypt_embeddings_one_way(detatched_embeddings))
+            del detatched_embeddings
+            timer.stop()
             record_loss, perplexity = train_on_batch(batch_X=embeddings,batch_D=batch_text,model=model_attacker,tokenizer=tokenizer_attacker,criterion=criterion,device=device,train=True)
             optimizer.step()
             scheduler.step()
@@ -124,7 +166,9 @@ def process_data(data,batch_size,device,config,need_porj=True):
 def process_data_test(data,batch_size,device,config,need_proj=True):
     #model = SentenceTransformer('all-roberta-large-v1',device=device)   # dim 1024
     #model = SentenceTransformer(config['embed_model_path'],device=device)   #  dim 768
-    device_1 = torch.device("cuda:0")
+    device_1 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
     model = SentenceTransformer(config['embed_model_path'],device=device_1)   # dim 768
     if(config['decode'] == 'beam'):
         save_path = 'models/' + 'attacker_gpt2_large_' + config['dataset'] + '_' + config['embed_model']+'_beam'+'.log'
@@ -161,6 +205,7 @@ def process_data_test(data,batch_size,device,config,need_proj=True):
   
             if need_proj:
                 embeddings = projection(embeddings)
+            embeddings = torch.from_numpy(encrypt_embeddings_one_way(embeddings.cpu().numpy()))
 
             sent_list, gt_list = eval_on_batch(batch_X=embeddings,batch_D=batch_text,model=config['model'],tokenizer=config['tokenizer'],device=device,config=config)    
             print(f'testing {idx} batch done with {idx*batch_size} samples')
@@ -271,6 +316,7 @@ if __name__ == '__main__':
     model_cards['sent_roberta'] = 'all-roberta-large-v1'
     model_cards['simcse_bert'] = 'princeton-nlp/sup-simcse-bert-large-uncased'
     model_cards['simcse_roberta'] = 'princeton-nlp/sup-simcse-roberta-large'
+    print(torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
     parser = argparse.ArgumentParser(description='Training external NN as baselines')
     parser.add_argument('--model_dir', type=str, default='microsoft/DialoGPT-large', help='Dir of your model')
     parser.add_argument('--num_epochs', type=int, default=10, help='Training epoches.')
@@ -292,13 +338,17 @@ if __name__ == '__main__':
     config['embed_model'] = args.embed_model
     config['decode'] = args.decode
     config['embed_model_path'] = model_cards[config['embed_model']]
-    config['device'] = torch.device("cuda")
+    config['device'] = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
     config['tokenizer'] = AutoTokenizer.from_pretrained('microsoft/DialoGPT-large')
     config['eos_token'] = config['tokenizer'].eos_token
     config['use_opt'] = False
 
     
-    device = torch.device("cuda:0")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
     #device = torch.device("cpu")
     batch_size = config['batch_size']
 
